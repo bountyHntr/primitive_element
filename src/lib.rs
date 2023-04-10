@@ -15,21 +15,21 @@ use threadpool::ThreadPool;
 #[derive(Debug, PartialEq, Eq)]
 pub struct FiniteField {
     prime_number: u128,
-    extension_degree: usize,
+    extension_power: usize,
     modulus: Vec<u128>,
 
     powers_by_factors: Vec<u128>,
 }
 
 impl FiniteField {
-    pub fn new(prime_number: u128, extension_degree: usize, modulus: Option<Vec<u128>>) -> Self {
+    pub fn new(prime_number: u128, extension_power: usize, modulus: Option<Vec<u128>>) -> Self {
         assert!(
-            extension_degree > 0,
-            "extension degree must be positive number"
+            extension_power > 0,
+            "extension power must be positive number"
         );
         assert!(prime_number > 1, "prime number must be greater than 1");
 
-        let multiplicative_order = prime_number.pow(extension_degree as u32) - 1;
+        let multiplicative_order = prime_number.pow(extension_power as u32) - 1;
 
         let modulus = match modulus {
             Some(poly) => poly,
@@ -38,10 +38,10 @@ impl FiniteField {
 
         assert_eq!(
             modulus.len() - 1,
-            extension_degree,
-            "invalid modulus for given extension degree"
+            extension_power,
+            "invalid irreducible polynomial for given extension power"
         );
-        assert_eq!(modulus[0], 1, "modulus must be monic polynomial");
+        assert_eq!(modulus[0], 1, "irreducible polynomial must be monic");
 
         let mut factors = Factorization::run(multiplicative_order).factors;
         factors.dedup();
@@ -53,7 +53,7 @@ impl FiniteField {
 
         FiniteField {
             prime_number,
-            extension_degree,
+            extension_power,
             modulus,
             powers_by_factors,
         }
@@ -63,8 +63,8 @@ impl FiniteField {
         self.prime_number
     }
 
-    pub fn extension_degree(&self) -> usize {
-        self.extension_degree
+    pub fn extension_power(&self) -> usize {
+        self.extension_power
     }
 
     pub fn modulus(&self) -> &[u128] {
@@ -83,11 +83,11 @@ impl FiniteFieldElement {
 
     pub fn new(field: Arc<FiniteField>, coefficients: Vec<u128>) -> FiniteFieldElement {
         assert_eq!(
-            field.extension_degree,
+            field.extension_power,
             coefficients.len(),
-            "invalid number of coefficients: {}; field extension degree: {}",
+            "invalid number of coefficients: {}; field extension power: {}",
             coefficients.len(),
-            field.extension_degree
+            field.extension_power
         );
 
         let coefficients = coefficients
@@ -104,7 +104,7 @@ impl FiniteFieldElement {
     pub fn zero(field: Arc<FiniteField>) -> FiniteFieldElement {
         FiniteFieldElement {
             field: field.clone(),
-            coefficients: VecDeque::from(vec![0u128; field.extension_degree]),
+            coefficients: VecDeque::from(vec![0u128; field.extension_power]),
         }
     }
 
@@ -152,7 +152,7 @@ impl FiniteFieldElement {
         let range = Uniform::new(0, field.prime_number);
         let mut rng = rand::thread_rng();
 
-        let coefficients: VecDeque<u128> = (0..field.extension_degree)
+        let coefficients: VecDeque<u128> = (0..field.extension_power)
             .map(|_| rng.sample(&range))
             .collect();
 
@@ -302,13 +302,13 @@ impl Mul<&Self> for FiniteFieldElement {
 
         let mut result = Self::zero(self.field.clone());
         let modulus = Self::new(self.field.clone(), self.field.modulus()[1..].to_owned());
-        let max_degree = rhs.coefficients.len() - 1;
+        let max_power = rhs.coefficients.len() - 1;
 
-        for i in 0..=max_degree {
-            let degree = max_degree - i;
+        for i in 0..=max_power {
+            let power = max_power - i;
             let mut tmp = self.clone() * rhs.coefficients[i];
 
-            for _ in 0..degree {
+            for _ in 0..power {
                 // left shift
                 let coef = tmp.coefficients.pop_front().unwrap();
                 tmp.coefficients.push_back(0);
@@ -327,20 +327,15 @@ impl Mul<&Self> for FiniteFieldElement {
 
 impl Display for FiniteFieldElement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let max_degree = self.coefficients.len() - 1;
+        let max_power = self.coefficients.len() - 1;
 
-        for i in 0..max_degree {
+        for i in 0..max_power {
             if self.coefficients[i] != 0 {
-                write!(f, "{}*x^{} + ", self.coefficients[i], max_degree - i)?;
+                write!(f, "{}*x^{} + ", self.coefficients[i], max_power - i)?;
             }
         }
 
-        let back = self.coefficients.back().unwrap();
-        if back != &0 {
-            write!(f, "{}", self.coefficients.back().unwrap())?;
-        }
-
-        Ok(())
+        write!(f, "{}", self.coefficients.back().unwrap())
     }
 }
 
@@ -355,7 +350,7 @@ mod tests {
         let field_element = FiniteFieldElement::random(field.clone());
 
         let coefs = field_element.coefficients();
-        assert_eq!(coefs.len(), field.extension_degree() as usize);
+        assert_eq!(coefs.len(), field.extension_power() as usize);
 
         let prime_number = field.prime_number();
         for i in 0..coefs.len() {
@@ -374,7 +369,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_invalid_extension_degree() {
+    fn test_invalid_extension_power() {
         FiniteField::new(3, 0, None);
     }
 

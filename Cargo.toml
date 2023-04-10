@@ -3,9 +3,12 @@ name = "primitive_element"
 version = "0.1.0"
 edition = "2021"
 
+authors = ["Ilia Koltsa <bountyhntr1337@gmail.com>"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 rand = "0.8.5"
 prime_factorization = "1.0.3"
 threadpool = "1.8.1"  
+clap = { version = "4.2.1", features = ["derive"] }
