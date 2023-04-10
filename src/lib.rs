@@ -1,11 +1,16 @@
 use std::collections::VecDeque;
 use std::fmt::Display;
 use std::ops::{Add, Mul, Sub};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 
 use rand::distributions::Uniform;
 use rand::Rng;
 
 use prime_factorization::Factorization;
+
+use threadpool::ThreadPool;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct FiniteField {
@@ -65,81 +70,51 @@ impl FiniteField {
     pub fn modulus(&self) -> &[u128] {
         &self.modulus
     }
+}
 
-    pub fn init_element(&self, coefficients: Vec<u128>) -> FiniteFieldElement {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct FiniteFieldElement {
+    field: Arc<FiniteField>,
+    coefficients: VecDeque<u128>,
+}
+
+impl FiniteFieldElement {
+    const N_WORKERS: usize = 4;
+
+    pub fn new(field: Arc<FiniteField>, coefficients: Vec<u128>) -> FiniteFieldElement {
         assert_eq!(
-            self.extension_degree,
+            field.extension_degree,
             coefficients.len(),
             "invalid number of coefficients: {}; field extension degree: {}",
             coefficients.len(),
-            self.extension_degree
+            field.extension_degree
         );
 
         let coefficients = coefficients
             .into_iter()
-            .map(|coefficient| coefficient % self.prime_number)
+            .map(|coefficient| coefficient % field.prime_number)
             .collect();
 
         FiniteFieldElement {
-            field: self,
+            field,
             coefficients,
         }
     }
 
-    pub fn zero_element(&self) -> FiniteFieldElement {
+    pub fn zero(field: Arc<FiniteField>) -> FiniteFieldElement {
         FiniteFieldElement {
-            field: self,
-            coefficients: VecDeque::from(vec![0u128; self.extension_degree]),
+            field: field.clone(),
+            coefficients: VecDeque::from(vec![0u128; field.extension_degree]),
         }
     }
 
-    pub fn identity_element(&self) -> FiniteFieldElement {
-        let mut ff_element = self.zero_element();
+    pub fn identity(field: Arc<FiniteField>) -> FiniteFieldElement {
+        let mut ff_element = Self::zero(field);
         *ff_element.coefficients.back_mut().unwrap() = 1;
 
         ff_element
     }
 
-    pub fn random_element(&self) -> FiniteFieldElement {
-        let range = Uniform::new(0, self.prime_number);
-        let mut rng = rand::thread_rng();
-
-        let coefficients: VecDeque<u128> = (0..self.extension_degree)
-            .map(|_| rng.sample(&range))
-            .collect();
-
-        FiniteFieldElement {
-            field: self,
-            coefficients,
-        }
-    }
-
-    pub fn primitive_element(&self) -> FiniteFieldElement {
-        'outer: loop {
-            let random_element = self.random_element();
-
-            if random_element.is_zero() {
-                continue;
-            }
-
-            for &power in &self.powers_by_factors {
-                if random_element.clone().pow(power).is_identity() {
-                    continue 'outer;
-                }
-            }
-
-            return random_element;
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct FiniteFieldElement<'a> {
-    field: &'a FiniteField,
-    coefficients: VecDeque<u128>,
-}
-
-impl<'a> FiniteFieldElement<'a> {
     pub fn is_identity(&self) -> bool {
         !self
             .coefficients
@@ -158,7 +133,7 @@ impl<'a> FiniteFieldElement<'a> {
     }
 
     pub fn pow(self, mut power: u128) -> Self {
-        let mut result = self.field.identity_element();
+        let mut result = Self::identity(self.field.clone());
         let mut square = self;
 
         while power != 0 {
@@ -172,9 +147,89 @@ impl<'a> FiniteFieldElement<'a> {
 
         result
     }
+
+    pub fn random(field: Arc<FiniteField>) -> FiniteFieldElement {
+        let range = Uniform::new(0, field.prime_number);
+        let mut rng = rand::thread_rng();
+
+        let coefficients: VecDeque<u128> = (0..field.extension_degree)
+            .map(|_| rng.sample(&range))
+            .collect();
+
+        FiniteFieldElement {
+            field,
+            coefficients,
+        }
+    }
+
+    pub fn primitive(field: Arc<FiniteField>) -> FiniteFieldElement {
+        'outer: loop {
+            let random_element = Self::random(field.clone());
+
+            if random_element.is_zero() {
+                continue;
+            }
+
+            for &power in &field.powers_by_factors {
+                if random_element.clone().pow(power).is_identity() {
+                    continue 'outer;
+                }
+            }
+
+            return random_element;
+        }
+    }
+
+    pub fn primitive_multithreaded(
+        field: Arc<FiniteField>,
+        n_workers: Option<usize>,
+    ) -> FiniteFieldElement {
+        let n_workers = match n_workers {
+            Some(n) => n,
+            None => Self::N_WORKERS,
+        };
+
+        let found = Arc::new(AtomicBool::new(false));
+        let pool = ThreadPool::new(n_workers);
+
+        let (tx, rx) = mpsc::channel();
+
+        for _ in 0..n_workers {
+            let tx = tx.clone();
+            let found = found.clone();
+            let field = field.clone();
+
+            pool.execute(move || {
+                'outer: while !found.load(Ordering::SeqCst) {
+                    let random_element = Self::random(field.clone());
+
+                    if random_element.is_zero() {
+                        continue;
+                    }
+
+                    for &power in &field.powers_by_factors {
+                        if found.load(Ordering::SeqCst) {
+                            return;
+                        }
+
+                        if random_element.clone().pow(power).is_identity() {
+                            continue 'outer;
+                        }
+                    }
+
+                    found.store(true, Ordering::SeqCst);
+                    tx.send(random_element).unwrap();
+                    return;
+                }
+            })
+        }
+
+        pool.join();
+        rx.recv().unwrap()
+    }
 }
 
-impl<'a> Add<&Self> for FiniteFieldElement<'a> {
+impl Add<&Self> for FiniteFieldElement {
     type Output = Self;
 
     fn add(mut self, rhs: &Self) -> Self::Output {
@@ -195,7 +250,7 @@ impl<'a> Add<&Self> for FiniteFieldElement<'a> {
     }
 }
 
-impl<'a> Sub<&Self> for FiniteFieldElement<'a> {
+impl Sub<&Self> for FiniteFieldElement {
     type Output = Self;
 
     fn sub(mut self, rhs: &Self) -> Self::Output {
@@ -222,7 +277,7 @@ impl<'a> Sub<&Self> for FiniteFieldElement<'a> {
     }
 }
 
-impl<'a> Mul<u128> for FiniteFieldElement<'a> {
+impl Mul<u128> for FiniteFieldElement {
     type Output = Self;
 
     fn mul(mut self, rhs: u128) -> Self::Output {
@@ -236,7 +291,7 @@ impl<'a> Mul<u128> for FiniteFieldElement<'a> {
     }
 }
 
-impl<'a> Mul<&Self> for FiniteFieldElement<'a> {
+impl Mul<&Self> for FiniteFieldElement {
     type Output = Self;
 
     fn mul(self, rhs: &Self) -> Self::Output {
@@ -245,10 +300,8 @@ impl<'a> Mul<&Self> for FiniteFieldElement<'a> {
             "elements do not belong to the same field"
         );
 
-        let mut result = self.field.zero_element();
-        let modulus = self
-            .field
-            .init_element(self.field.modulus()[1..].to_owned());
+        let mut result = Self::zero(self.field.clone());
+        let modulus = Self::new(self.field.clone(), self.field.modulus()[1..].to_owned());
         let max_degree = rhs.coefficients.len() - 1;
 
         for i in 0..=max_degree {
@@ -272,13 +325,22 @@ impl<'a> Mul<&Self> for FiniteFieldElement<'a> {
     }
 }
 
-impl Display for FiniteFieldElement<'_> {
+impl Display for FiniteFieldElement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let max_degree = self.coefficients.len() - 1;
+
         for i in 0..max_degree {
-            write!(f, "{}*x^{} + ", self.coefficients[i], max_degree - i)?;
+            if self.coefficients[i] != 0 {
+                write!(f, "{}*x^{} + ", self.coefficients[i], max_degree - i)?;
+            }
         }
-        write!(f, "{}", self.coefficients.back().unwrap())
+
+        let back = self.coefficients.back().unwrap();
+        if back != &0 {
+            write!(f, "{}", self.coefficients.back().unwrap())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -289,8 +351,8 @@ mod tests {
     #[test]
     fn test_random_element() {
         let modulus = Some(vec![1, 1, 0, 0, 2]); // x^4 + x^3 + 2
-        let field = FiniteField::new(3, 4, modulus);
-        let field_element = field.random_element();
+        let field = Arc::new(FiniteField::new(3, 4, modulus));
+        let field_element = FiniteFieldElement::random(field.clone());
 
         let coefs = field_element.coefficients();
         assert_eq!(coefs.len(), field.extension_degree() as usize);
@@ -305,9 +367,9 @@ mod tests {
     #[should_panic]
     fn test_ff_element_invalid_num_of_coefficient() {
         let modulus = Some(vec![1, 1, 0, 0, 2]); // x^4 + x^3 + 2
-        let field = FiniteField::new(3, 4, modulus);
+        let field = Arc::new(FiniteField::new(3, 4, modulus));
 
-        field.init_element(vec![1, 1, 0]);
+        FiniteFieldElement::new(field, vec![1, 1, 0]);
     }
 
     #[test]
@@ -325,150 +387,159 @@ mod tests {
     #[test]
     fn test_add() {
         let modulus = Some(vec![1, 0, 1]); // x^2 + 1
-        let field = FiniteField::new(3, 2, modulus);
+        let field = Arc::new(FiniteField::new(3, 2, modulus));
 
-        let el1 = field.init_element(vec![2, 0]);
-        let el2 = field.init_element(vec![2, 1]);
+        let el1 = FiniteFieldElement::new(field.clone(), vec![2, 0]);
+        let el2 = FiniteFieldElement::new(field.clone(), vec![2, 1]);
 
-        let expected_result = field.init_element(vec![1, 1]);
+        let expected_result = FiniteFieldElement::new(field, vec![1, 1]);
         assert_eq!(el1 + &el2, expected_result);
     }
 
     #[test]
     fn test_add_prime_field() {
-        let field = FiniteField::new(7, 1, None);
-        let el1 = field.init_element(vec![6]);
-        let el2 = field.init_element(vec![3]);
+        let field = Arc::new(FiniteField::new(7, 1, None));
+        let el1 = FiniteFieldElement::new(field.clone(), vec![6]);
+        let el2 = FiniteFieldElement::new(field.clone(), vec![3]);
 
-        let expected_result = field.init_element(vec![2]);
+        let expected_result = FiniteFieldElement::new(field, vec![2]);
         assert_eq!(el1 + &el2, expected_result);
     }
 
     #[test]
     fn test_sub() {
         let modulus = Some(vec![1, 0, 1]); // x^2 + 1
-        let field = FiniteField::new(3, 2, modulus);
+        let field = Arc::new(FiniteField::new(3, 2, modulus));
 
-        let el1 = field.init_element(vec![2, 0]);
-        let el2 = field.init_element(vec![1, 1]);
+        let el1 = FiniteFieldElement::new(field.clone(), vec![2, 0]);
+        let el2 = FiniteFieldElement::new(field.clone(), vec![1, 1]);
 
-        let expected_result = field.init_element(vec![1, 2]);
+        let expected_result = FiniteFieldElement::new(field, vec![1, 2]);
         assert_eq!(el1 - &el2, expected_result);
     }
 
     #[test]
     fn test_mul_by_scalar() {
         let modulus = Some(vec![1, 0, 1]); // x^2 + 1
-        let field = FiniteField::new(3, 2, modulus);
-        let el = field.init_element(vec![2, 1]);
+        let field = Arc::new(FiniteField::new(3, 2, modulus));
+        let el = FiniteFieldElement::new(field.clone(), vec![2, 1]);
 
-        let expected_result = field.init_element(vec![1, 2]);
+        let expected_result = FiniteFieldElement::new(field, vec![1, 2]);
         assert_eq!(el * 2, expected_result);
     }
 
     #[test]
     fn test_mul_by_ff_element() {
-        let field = FiniteField::new(3, 2, Some(vec![1, 0, 1]));
+        let field = Arc::new(FiniteField::new(3, 2, Some(vec![1, 0, 1])));
 
-        let el1 = field.init_element(vec![2, 2]);
-        let el2 = field.init_element(vec![2, 0]);
+        let el1 = FiniteFieldElement::new(field.clone(), vec![2, 2]);
+        let el2 = FiniteFieldElement::new(field.clone(), vec![2, 0]);
 
-        let expected_result = field.init_element(vec![1, 2]);
+        let expected_result = FiniteFieldElement::new(field.clone(), vec![1, 2]);
         assert_eq!(el1 * &el2, expected_result);
 
-        let el1 = field.init_element(vec![2, 2]);
-        let el2 = field.init_element(vec![2, 1]);
+        let el1 = FiniteFieldElement::new(field.clone(), vec![2, 2]);
+        let el2 = FiniteFieldElement::new(field.clone(), vec![2, 1]);
 
-        let expected_result = field.init_element(vec![0, 1]);
+        let expected_result = FiniteFieldElement::new(field.clone(), vec![0, 1]);
         assert_eq!(el1 * &el2, expected_result);
 
-        let field = FiniteField::new(
+        let field = Arc::new(FiniteField::new(
             4231,
             10,
             Some(vec![
                 1, 2049, 1194, 2386, 459, 1980, 2554, 3295, 1898, 2831, 311,
             ]),
+        ));
+
+        let el1 = FiniteFieldElement::new(
+            field.clone(),
+            vec![4108, 1006, 1002, 973, 2776, 1231, 740, 4221, 1494, 1640],
+        );
+        let el2 = FiniteFieldElement::new(
+            field.clone(),
+            vec![3461, 3711, 3786, 3325, 284, 3477, 522, 1690, 539, 632],
         );
 
-        let el1 = field.init_element(vec![
-            4108, 1006, 1002, 973, 2776, 1231, 740, 4221, 1494, 1640,
-        ]);
-        let el2 = field.init_element(vec![3461, 3711, 3786, 3325, 284, 3477, 522, 1690, 539, 632]);
-
-        let expected_result = field.init_element(vec![
-            613, 1441, 2609, 3956, 4054, 922, 1799, 3469, 3759, 2220,
-        ]);
+        let expected_result = FiniteFieldElement::new(
+            field,
+            vec![613, 1441, 2609, 3956, 4054, 922, 1799, 3469, 3759, 2220],
+        );
         assert_eq!(el1 * &el2, expected_result);
     }
 
     #[test]
     fn test_mul_prime_field() {
-        let field = FiniteField::new(7, 1, None);
-        let el1 = field.init_element(vec![6]);
-        let el2 = field.init_element(vec![3]);
+        let field = Arc::new(FiniteField::new(7, 1, None));
+        let el1 = FiniteFieldElement::new(field.clone(), vec![6]);
+        let el2 = FiniteFieldElement::new(field.clone(), vec![3]);
 
-        let expected_result = field.init_element(vec![4]);
+        let expected_result = FiniteFieldElement::new(field, vec![4]);
         assert_eq!(el1 * &el2, expected_result);
     }
 
     #[test]
     fn test_pow() {
-        let field = FiniteField::new(3, 2, Some(vec![1, 0, 1]));
+        let field = Arc::new(FiniteField::new(3, 2, Some(vec![1, 0, 1])));
 
-        let el = field.init_element(vec![2, 2]);
-        let expected_result = field.init_element(vec![0, 2]);
+        let el = FiniteFieldElement::new(field.clone(), vec![2, 2]);
+        let expected_result = FiniteFieldElement::new(field.clone(), vec![0, 2]);
         assert_eq!(el.pow(4), expected_result);
 
-        let el = field.init_element(vec![0, 2]);
-        let expected_result = field.init_element(vec![0, 1]);
+        let el = FiniteFieldElement::new(field.clone(), vec![0, 2]);
+        let expected_result = FiniteFieldElement::new(field, vec![0, 1]);
         assert_eq!(el.pow(2), expected_result);
 
-        let field = FiniteField::new(
+        let field = Arc::new(FiniteField::new(
             4231,
             10,
             Some(vec![
                 1, 2049, 1194, 2386, 459, 1980, 2554, 3295, 1898, 2831, 311,
             ]),
-        );
+        ));
 
-        let el = field.init_element(vec![
-            403, 2783, 3190, 2185, 2879, 318, 3562, 1792, 2847, 1826,
-        ]);
-        let expected_result = field.init_element(vec![
-            4108, 1006, 1002, 973, 2776, 1231, 740, 4221, 1494, 1640,
-        ]);
+        let el = FiniteFieldElement::new(
+            field.clone(),
+            vec![403, 2783, 3190, 2185, 2879, 318, 3562, 1792, 2847, 1826],
+        );
+        let expected_result = FiniteFieldElement::new(
+            field.clone(),
+            vec![4108, 1006, 1002, 973, 2776, 1231, 740, 4221, 1494, 1640],
+        );
         assert_eq!(el.pow(23234234), expected_result);
 
-        let el = field.init_element(vec![
-            403, 2783, 3190, 2185, 2879, 318, 3562, 1792, 2847, 1826,
-        ]);
-        let expected_result = field.init_element(vec![
-            2600, 1009, 2476, 1944, 1322, 3033, 910, 576, 240, 2985,
-        ]);
+        let el = FiniteFieldElement::new(
+            field.clone(),
+            vec![403, 2783, 3190, 2185, 2879, 318, 3562, 1792, 2847, 1826],
+        );
+        let expected_result = FiniteFieldElement::new(
+            field,
+            vec![2600, 1009, 2476, 1944, 1322, 3033, 910, 576, 240, 2985],
+        );
         assert_eq!(el.pow(234234928348923984923982438), expected_result);
     }
 
     #[test]
     fn test_is_identity() {
         let modulus = Some(vec![1, 0, 1]); // x^2 + 1
-        let field = FiniteField::new(3, 2, modulus);
+        let field = Arc::new(FiniteField::new(3, 2, modulus));
 
-        let el = field.init_element(vec![0, 1]);
+        let el = FiniteFieldElement::new(field.clone(), vec![0, 1]);
         assert!(el.is_identity());
 
-        let el = field.init_element(vec![0, 0]);
+        let el = FiniteFieldElement::new(field, vec![0, 0]);
         assert!(!el.is_identity());
     }
 
     #[test]
     fn test_is_zero() {
         let modulus = Some(vec![1, 0, 1]); // x^2 + 1
-        let field = FiniteField::new(3, 2, modulus);
+        let field = Arc::new(FiniteField::new(3, 2, modulus));
 
-        let el = field.init_element(vec![0, 0]);
+        let el = FiniteFieldElement::new(field.clone(), vec![0, 0]);
         assert!(el.is_zero());
 
-        let el = field.init_element(vec![0, 1]);
+        let el = FiniteFieldElement::new(field, vec![0, 1]);
         assert!(!el.is_zero());
     }
 }
