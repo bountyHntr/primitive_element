@@ -39,7 +39,7 @@ impl FiniteField {
         assert_eq!(
             modulus.len() - 1,
             extension_power,
-            "invalid irreducible polynomial for given extension power"
+            "invalid irreducible polynomial degree for given extension power"
         );
         assert_eq!(modulus[0], 1, "irreducible polynomial must be monic");
 
